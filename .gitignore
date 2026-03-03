@@ -1,0 +1,26 @@
+# Build artifacts
+build/
+*.o
+*.out
+*.exe
+*.a
+*.so
+*.dylib
+
+# Executables
+remainingLen
+mqtt_broker
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# CMake
+CMakeUserPresets.json
