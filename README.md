@@ -1,4 +1,4 @@
-# MQTT Broker (C++)
+# MQTT Broker
 
 > A lightweight **MQTT broker implementation in C++** built from scratch to understand the internal working of the MQTT protocol — packet parsing, serialization, and broker message routing.
 
