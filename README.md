@@ -1,254 +1,92 @@
-# MQTT Broker (C++)
+# Sol - C++ MQTT Broker
 
-> A lightweight **MQTT broker implementation in C++** built from scratch to understand the internal working of the MQTT protocol — packet parsing, serialization, and broker message routing.
+**Sol** is a lightweight, non-blocking MQTT v3.1.1 broker built from scratch in C++. It features a high-performance `kqueue`-based event loop, a custom Trie for advanced topic routing (including wildcard support), and a robust asynchronous state machine capable of handling TCP packet fragmentation.
 
----
+## Architecture & How It Works
 
-## 📡 What is MQTT?
+The broker is divided into several modular components that work together asynchronously:
 
-**MQTT (Message Queuing Telemetry Transport)** is a lightweight publish–subscribe messaging protocol widely used in:
+### 1. The Event Loop (`network.cpp` / `network.hpp`)
+At the core of the broker is a custom, non-blocking event loop built using macOS `kqueue`. It multiplexes all I/O events without using multiple threads.
+- **Connections:** When a new client connects, the kernel notifies the event loop, triggering `on_accept`.
+- **I/O:** When data arrives on a socket, the loop triggers `on_read`. When the kernel socket buffer is ready to accept outgoing data, it triggers `on_write`.
+- **Timers:** The loop supports periodic tasks using `EVFILT_TIMER`, such as publishing internal broker statistics.
 
-* IoT devices
-* Smart homes
-* Sensors & telemetry systems
-* Embedded systems
-* Low-bandwidth networks
+### 2. Client State Machine (`server.hpp` / `server.cpp`)
+Because TCP is a continuous stream protocol, a single MQTT packet might arrive in multiple pieces, causing non-blocking reads to return `EAGAIN`. To handle this without blocking the server or dropping the client, each client tracks its reading phase via a state machine:
+- `WAITING_HEADER`: Waiting for the MQTT Control Packet Type byte.
+- `WAITING_LENGTH`: Progressively decoding the "remaining length" of the packet.
+- `WAITING_DATA`: Accumulating exactly the number of payload bytes defined by the length.
+- `SENDING_DATA`: The packet is fully formed and ready to be processed by a command handler.
 
-Instead of direct communication:
+### 3. Protocol Parsing (`mqtt.cpp` / `mqtt.hpp` / `pack.cpp`)
+Once a full packet is buffered by the state machine, it is passed to the parser. 
+- The parser deserializes the raw byte stream into structured C++ unions (`union mqtt_packet`). 
+- Outgoing packets are serialized back into byte streams using `pack_mqtt_packet` before being sent back to the client.
 
-```
-Client → Broker → Subscribers
-```
-
-Clients publish messages to **topics**, and subscribed clients receive them.
-
----
-
-## 🏗️ Project Structure
-
-```
-MQTT/
-│
-├── sol/
-│   ├── src/protocol/
-│   │   ├── FixedHeader.h
-│   │   ├── packetParser.cpp
-│   │   ├── packetSerializer.cpp
-│   │   ├── packets.h
-│   │   └── remainingLength.*
-│   │
-│   └── build/        (ignored)
-│
-├── CMakeLists.txt
-└── README.md
-```
+### 4. Topic Routing & Wildcards (`trie.cpp` / `trie.hpp`)
+MQTT allows clients to subscribe to hierarchical topics (like `home/livingroom/temp`) and use wildcards (`+` for a single level, `#` for all remaining levels). 
+- **The Trie:** To route messages efficiently, the broker stores subscriptions in a Trie (Prefix Tree).
+- **Matching:** When a `PUBLISH` message is received, the broker recursively walks the Trie to find all matching topic nodes, automatically honoring wildcards. It then broadcasts the message to all `std::list<subscriber>` attached to those nodes.
 
 ---
 
-## ⚙️ Build Instructions
+## Guide: How to Build and Use
+
+### Prerequisites
+- macOS (requires `kqueue` and `CoreServices` for UUID generation)
+- `cmake` and a modern C++ compiler (`clang++` or `g++`)
+- `mosquitto` client tools (optional, but highly recommended for testing)
+
+### Building the Broker
+
+Navigate to the root of the project directory and run the standard CMake build process:
 
 ```bash
 mkdir build
 cd build
 cmake ..
-make
-./mqtt_broker
+make -j4
 ```
 
----
+This will compile the `sol` executable inside the `build` directory.
 
-# 📦 MQTT Packet Structure
+### Running the Broker
 
-Every MQTT packet contains:
+Start the broker by running the executable. You can provide optional flags to change the binding address, port, or enable verbose logging.
 
-```
-+------------------+
-| Fixed Header     |
-+------------------+
-| Variable Header  |
-+------------------+
-| Payload          |
-+------------------+
+```bash
+# Start the broker with default settings (127.0.0.1:1883)
+./sol
+
+# Start the broker on all interfaces, port 1883, with verbose debug logging enabled
+./sol -a 0.0.0.0 -p 1883 -v
 ```
 
----
+### Testing with Mosquitto Clients
 
-# 🔹 Fixed Header
+You can test the broker using the standard Mosquitto command-line tools in separate terminal windows.
 
-The Fixed Header tells the broker:
-
-✅ What kind of packet is this?
-✅ How large is the message?
-
----
-
-<details>
-<summary>🔎 Bit Layout (Click to Expand)</summary>
-
-```
-Bit:   7   6   5   4 | 3 | 2 | 1 | 0
-       -------------------------------
-       Packet Type    |     Flags
+**1. Subscribe to a topic with a wildcard:**
+```bash
+# Subscribe to all sensor topics
+mosquitto_sub -h 127.0.0.1 -p 1883 -t "home/sensors/#" -d
 ```
 
-```
-Byte 1  → MQTT Control Type + Flags
-Byte 2+ → Remaining Length
-```
-
-</details>
-
----
-
-## Fixed Header Structure
-
-| Byte | Bits     | Field               | Description              |
-| ---- | -------- | ------------------- | ------------------------ |
-| 1    | 7–4      | Control Packet Type | MQTT message type        |
-| 1    | 3–0      | Flags               | Packet-specific flags    |
-| 2–5  | Variable | Remaining Length    | Size of remaining packet |
-
----
-
-<details>
-<summary>📡 Control Packet Types</summary>
-
-| Binary | Decimal | Packet      |
-| ------ | ------- | ----------- |
-| 0001   | 1       | CONNECT     |
-| 0010   | 2       | CONNACK     |
-| 0011   | 3       | PUBLISH     |
-| 0100   | 4       | PUBACK      |
-| 1000   | 8       | SUBSCRIBE   |
-| 1001   | 9       | SUBACK      |
-| 1010   | 10      | UNSUBSCRIBE |
-| 1100   | 12      | PINGREQ     |
-| 1101   | 13      | PINGRESP    |
-| 1110   | 14      | DISCONNECT  |
-
-</details>
-
----
-
-<details>
-<summary>⚙️ Flags (PUBLISH Packet)</summary>
-
-| Bit | Name   | Meaning            |
-| --- | ------ | ------------------ |
-| 3   | DUP    | Duplicate delivery |
-| 2–1 | QoS    | Quality of Service |
-| 0   | RETAIN | Retain message     |
-
-### QoS Levels
-
-| Bits | QoS           |
-| ---- | ------------- |
-| 00   | At most once  |
-| 01   | At least once |
-| 10   | Exactly once  |
-
-</details>
-
----
-
-<details>
-<summary>📏 Remaining Length Encoding</summary>
-
-Remaining Length uses **Variable Byte Integer encoding**.
-
-Each byte:
-
-```
-Bit 7 → Continuation bit
-Bits 6–0 → Value (0–127)
+**2. Publish to a specific topic:**
+```bash
+# Publish a message to the temperature sensor topic
+mosquitto_pub -h 127.0.0.1 -p 1883 -t "home/sensors/temperature" -m "22.5 C" -d
 ```
 
-Algorithm:
+You should instantly see the `mosquitto_sub` terminal receive the `"22.5 C"` message, while the broker's verbose logs (`-v`) will display the internal packet flow (`CONNECT`, `SUBSCRIBE`, `PUBLISH`, `PUBACK`).
 
-```cpp
-int multiplier = 1;
-int value = 0;
+### Code Structure Reference
 
-do {
-    byte = readByte();
-    value += (byte & 127) * multiplier;
-    multiplier *= 128;
-} while (byte & 128);
-```
-
-✔ MSB = 1 → more bytes follow
-✔ MSB = 0 → last byte
-
-</details>
-
----
-
-## 🧠 Mental Model
-
-```
-Byte 1 → WHAT packet?
-Byte 2+ → HOW BIG is it?
-```
-
----
-
-## 🔬 Example
-
-```
-Hex: 30 0A
-```
-
-| Byte | Meaning                     |
-| ---- | --------------------------- |
-| 0x30 | PUBLISH packet              |
-| 0x0A | Remaining length = 10 bytes |
-
----
-
-# 🚀 Features Implemented
-
-* MQTT Fixed Header parsing
-* Packet serialization
-* Remaining Length decoding
-* CONNECT / PUBLISH / SUBSCRIBE handling
-* Modular packet architecture
-
----
-
-# 🎯 Learning Goals
-
-This project focuses on understanding:
-
-* Network protocol design
-* Binary parsing
-* Bit manipulation
-* Broker architecture
-* C++ systems programming
-
----
-
-# 🛠️ Tech Stack
-
-* **C++17**
-* **CMake**
-* TCP Socket Programming
-* MQTT Protocol (v3.1.1 concepts)
-
----
-
-# 📚 Future Improvements
-
-* QoS message flow
-* Retained messages
-* Persistent sessions
-* Multi-client handling
-* Async networking
-
----
-
-# 👨‍💻 Author
-
-**Tharun Tej**
-
-GitHub: https://github.com/tharun-7733
-
+- **`src/main.cpp`**: Application entry point, CLI arguments parsing.
+- **`src/server.cpp`**: Command handlers (`CONNECT`, `PUBLISH`, `SUBSCRIBE`, etc.) and the I/O state machine.
+- **`src/network.cpp`**: Non-blocking `kqueue` event loop abstraction.
+- **`src/mqtt.cpp`**: MQTT v3.1.1 byte-level deserialization.
+- **`src/pack.cpp`**: MQTT v3.1.1 byte-level serialization.
+- **`src/trie.cpp`**: Topic routing tree and wildcard evaluation algorithms.
+- **`src/config.cpp`**: Global configurations (Max request sizes, logging, etc.).

@@ -14,6 +14,7 @@ struct closure;
 #define ERRCLIENTDC    1
 #define ERRPACKETERR   2
 #define ERRMAXREQSIZE  3
+#define ERREAGAIN      4
 
 /* Handler return codes */
 #define REARM_R    0

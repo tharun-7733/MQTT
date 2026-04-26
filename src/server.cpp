@@ -69,6 +69,7 @@ struct topic *sol_topic_get(struct sol_extended *s, const char *name) {
 typedef int handler(struct closure *, union mqtt_packet *);
 
 static int connect_handler(struct closure *cb, union mqtt_packet *pkt) {
+    struct sol_client *c = static_cast<struct sol_client *>(cb->obj);
     std::string cid = reinterpret_cast<char*>(pkt->connect.payload.client_id);
     if (sol.clients.find(cid) != sol.clients.end()) {
         sol_info("Received double CONNECT from %s, disconnecting client", cid.c_str());
@@ -83,14 +84,8 @@ static int connect_handler(struct closure *cb, union mqtt_packet *pkt) {
     sol_info("New client connected as %s (c%i, k%u)", cid.c_str(),
              pkt->connect.bits.clean_session, pkt->connect.payload.keepalive);
 
-    struct sol_client *new_client = new struct sol_client;
-    new_client->fd = cb->fd;
-    new_client->client_id = cid;
-    new_client->will_topic = nullptr;
-    new_client->will_message = nullptr;
-
-    sol.clients[cid] = new_client;
-    cb->obj = new_client;
+    c->client_id = cid;
+    sol.clients[cid] = c;
 
     union mqtt_packet connack;
     unsigned char session_present = 0;
@@ -375,9 +370,22 @@ static void on_accept(struct evloop *loop, void *arg) {
     struct connection conn;
     if (accept_new_client(server->fd, &conn) < 0) return;
 
+    struct sol_client *c = new struct sol_client;
+    c->fd = conn.fd;
+    c->status = WAITING_HEADER;
+    c->rpos = 0;
+    c->read = 0;
+    c->toread = 0;
+    c->rbuf = new uint8_t[conf->max_request_size];
+    c->wrote = 0;
+    c->towrite = 0;
+    c->wbuf = nullptr;
+    c->will_topic = nullptr;
+    c->will_message = nullptr;
+
     struct closure *client_closure = new struct closure;
     client_closure->fd = conn.fd;
-    client_closure->obj = nullptr;
+    client_closure->obj = c;
     client_closure->payload = nullptr;
     client_closure->args = client_closure;
     client_closure->call = on_read;
@@ -392,71 +400,116 @@ static void on_accept(struct evloop *loop, void *arg) {
     sol_info("New connection from %s on port %s", conn.ip, conf->port);
 }
 
-static ssize_t recv_packet(int clientfd, uint8_t *buf, char *command) {
-    ssize_t nbytes = 0;
-    if ((nbytes = recv_bytes(clientfd, buf, 1)) <= 0)
-        return -ERRCLIENTDC;
-    
-    uint8_t byte = *buf;
-    buf++;
-    if (DISCONNECT < byte || CONNECT > byte)
-        return -ERRPACKETERR;
+static ssize_t recv_packet(struct sol_client *c) {
+    ssize_t nread = 0;
+    unsigned opcode = 0;
+    unsigned long long pktlen = 0LL;
+    size_t pos = 0;
 
-    uint8_t buff[4];
-    int count = 0;
-    ssize_t n = 0;
-    do {
-        if ((n = recv_bytes(clientfd, buf + count, 1)) <= 0)
+    if (c->status == WAITING_HEADER) {
+        nread = recv_bytes(c->fd, c->rbuf + c->read, 2 - c->read);
+        if (errno != EAGAIN && errno != EWOULDBLOCK && nread <= 0)
             return -ERRCLIENTDC;
-        buff[count] = buf[count];
-        nbytes += n;
-    } while (buff[count++] & (1 << 7));
-
-    const uint8_t *pbuf = &buff[0];
-    unsigned long long tlen = mqtt_decode_length(&pbuf);
-
-    if (tlen > conf->max_request_size) {
-        nbytes = -ERRMAXREQSIZE;
-        goto err;
+        c->read += nread > 0 ? nread : 0;
+        if (c->read < 2)
+            return -ERREAGAIN;
+        c->status = WAITING_LENGTH;
     }
 
-    if ((n = recv_bytes(clientfd, buf + count, tlen)) < 0)
-        goto err;
-    nbytes += n;
-    *command = byte;
-    return nbytes;
+    if (c->status == WAITING_LENGTH) {
+        if (c->read == 2) {
+            opcode = c->rbuf[0] >> 4;
+            if (DISCONNECT < opcode || CONNECT > opcode)
+                return -ERRPACKETERR;
+            if (opcode > UNSUBSCRIBE) {
+                c->rpos = 2;
+                c->toread = c->read;
+                goto exit_read;
+            }
+        }
 
-err:
-    shutdown(clientfd, SHUT_RDWR);
-    close(clientfd);
-    return nbytes;
+        nread = recv_bytes(c->fd, c->rbuf + c->read, 4 - c->read);
+        if (errno != EAGAIN && errno != EWOULDBLOCK && nread <= 0)
+            return -ERRCLIENTDC;
+        c->read += nread > 0 ? nread : 0;
+        if (c->read < 4)
+            return -ERREAGAIN;
+
+        const uint8_t *pbuf = c->rbuf + 1;
+        pktlen = mqtt_decode_length(&pbuf);
+        pos = pbuf - (c->rbuf + 1);
+
+        if (pktlen > conf->max_request_size)
+            return -ERRMAXREQSIZE;
+
+        c->rpos = pos + 1;
+        c->toread = pktlen + c->rpos; // length + bytes for length encoding + 1 byte for header
+
+        if (pktlen <= 4)
+            goto exit_read;
+        c->status = WAITING_DATA;
+    }
+
+    if (c->status == WAITING_DATA) {
+        nread = recv_bytes(c->fd, c->rbuf + c->read, c->toread - c->read);
+        if (errno != EAGAIN && errno != EWOULDBLOCK && nread <= 0)
+            return -ERRCLIENTDC;
+        c->read += nread > 0 ? nread : 0;
+        if (c->read < c->toread)
+            return -ERREAGAIN;
+    }
+
+exit_read:
+    return 0;
 }
 
 static void on_read(struct evloop *loop, void *arg) {
     struct closure *cb = static_cast<struct closure *>(arg);
-    uint8_t *buffer = new uint8_t[conf->max_request_size];
-    char command = 0;
+    struct sol_client *c = static_cast<struct sol_client *>(cb->obj);
     union mqtt_header hdr;
 
-    ssize_t bytes = recv_packet(cb->fd, buffer, &command);
+    if (c->status == SENDING_DATA) return;
 
-    if (bytes == -ERRCLIENTDC || bytes == -ERRMAXREQSIZE)
+    ssize_t err = recv_packet(c);
+    
+    if (err == -ERREAGAIN) {
+        evloop_rearm_callback_read(loop, cb);
+        return;
+    }
+    
+    if (err < 0) {
         goto errdc;
-    if (bytes == -ERRPACKETERR)
-        goto errdc;
-        
-    info.bytes_recv += bytes;
+    }
+    
+    if (c->read < c->toread) {
+        evloop_rearm_callback_read(loop, cb);
+        return;
+    }
+
+    info.bytes_recv += c->read;
+    c->status = SENDING_DATA;
 
     union mqtt_packet packet;
-    if (unpack_mqtt_packet(buffer, &packet) != 0) goto errdc;
-    hdr.byte = static_cast<uint8_t>(command);
+    if (unpack_mqtt_packet(c->rbuf + c->rpos, &packet) != 0) goto errdc;
+    hdr.byte = static_cast<uint8_t>(c->rbuf[0]);
+
+    c->toread = c->read = c->rpos = 0; // Reset for next packet
 
     if (handlers[hdr.bits.type]) {
         int rc = handlers[hdr.bits.type](cb, &packet);
         if (rc == REARM_W) {
+            c->status = WAITING_HEADER;
             cb->call = on_write;
+            
+            // Set up write buffer from cb->payload
+            if (cb->payload) {
+                c->wbuf = cb->payload->data;
+                c->towrite = cb->payload->size;
+                c->wrote = 0;
+            }
             evloop_rearm_callback_write(loop, cb);
         } else if (rc == REARM_R) {
+            c->status = WAITING_HEADER;
             cb->call = on_read;
             evloop_rearm_callback_read(loop, cb);
         } else if (rc == REARM_NONE) {
@@ -464,20 +517,26 @@ static void on_read(struct evloop *loop, void *arg) {
         }
     }
 
-    mqtt_packet_release(&packet, hdr.bits.type);
-    delete[] buffer;
+    if (hdr.bits.type != PUBLISH)
+        mqtt_packet_release(&packet, hdr.bits.type);
+        
     return;
 
 errdc:
-    delete[] buffer;
     sol_error("Dropping client");
     shutdown(cb->fd, SHUT_RDWR);
     close(cb->fd);
     
-    if (cb->obj) {
-        struct sol_client *client = static_cast<struct sol_client *>(cb->obj);
-        sol.clients.erase(client->client_id);
-        delete client;
+    if (c) {
+        if (!c->client_id.empty()) {
+            sol.clients.erase(c->client_id);
+        }
+        delete[] c->rbuf;
+        if (cb->payload) {
+            bytestring_release(cb->payload);
+            cb->payload = nullptr;
+        }
+        delete c;
     }
     
     std::string cid = cb->closure_id;
@@ -490,16 +549,30 @@ errdc:
 
 static void on_write(struct evloop *loop, void *arg) {
     struct closure *cb = static_cast<struct closure *>(arg);
-    ssize_t sent;
-    if ((sent = send_bytes(cb->fd, cb->payload->data, cb->payload->size)) < 0) {
-        struct sol_client *sc = static_cast<struct sol_client *>(cb->obj);
+    struct sol_client *c = static_cast<struct sol_client *>(cb->obj);
+    
+    ssize_t sent = send_bytes(cb->fd, c->wbuf + c->wrote, c->towrite - c->wrote);
+    if (errno != EAGAIN && errno != EWOULDBLOCK && sent < 0) {
         sol_error("Error writing on socket to client %s: %s",
-                  sc ? sc->client_id.c_str() : "unknown", strerror(errno));
+                  c->client_id.c_str(), strerror(errno));
+    }
+    
+    if (sent > 0) {
+        c->wrote += sent;
+        info.bytes_sent += sent;
+    }
+    
+    if (c->wrote < c->towrite && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        evloop_rearm_callback_write(loop, cb);
+        return;
     }
 
-    info.bytes_sent += sent;
-    bytestring_release(cb->payload);
-    cb->payload = nullptr;
+    if (cb->payload) {
+        bytestring_release(cb->payload);
+        cb->payload = nullptr;
+    }
+    c->towrite = c->wrote = 0;
+    c->wbuf = nullptr;
 
     cb->call = on_read;
     evloop_rearm_callback_read(loop, cb);
