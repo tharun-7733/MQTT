@@ -37,6 +37,7 @@ static void publish_stats(struct evloop *, void *);
 struct topic *topic_create(const std::string &name) {
     struct topic *t = new struct topic;
     t->name = name;
+    t->retained = nullptr;
     return t;
 }
 
@@ -85,6 +86,8 @@ static int connect_handler(struct closure *cb, union mqtt_packet *pkt) {
              pkt->connect.bits.clean_session, pkt->connect.payload.keepalive);
 
     c->client_id = cid;
+    c->keepalive = pkt->connect.payload.keepalive;
+    c->last_seen = time(nullptr);
     sol.clients[cid] = c;
 
     union mqtt_packet connack;
@@ -123,6 +126,49 @@ static void recursive_subscription(struct trie_node *node, void *arg) {
     t->subscribers.push_back(*s);
 }
 
+static void send_retained_message(struct sol_client *c, struct topic *t, unsigned max_qos) {
+    if (!t->retained) return;
+
+    union mqtt_packet pkt;
+    unsigned qos = t->retained->qos;
+    if (qos > max_qos) qos = max_qos;
+
+    uint8_t header_byte = PUBLISH_BYTE | 1 | (qos << 1); 
+    uint16_t pkt_id = (qos > 0) ? 1 : 0; // Temp placeholder
+
+    struct mqtt_publish *pub = mqtt_packet_publish(
+        header_byte, 
+        pkt_id, 
+        t->name.length(), 
+        reinterpret_cast<uint8_t*>(const_cast<char*>(t->name.c_str())),
+        t->retained->payload_len, 
+        t->retained->payload
+    );
+    pkt.publish = *pub;
+
+    size_t publen = MQTT_HEADER_LEN + sizeof(uint16_t) + pkt.publish.topiclen + pkt.publish.payloadlen;
+    if (qos > AT_MOST_ONCE) publen += sizeof(uint16_t);
+            
+    int remaininglen_offset = 0;
+    if ((publen - 1) > 0x200000) remaininglen_offset = 3;
+    else if ((publen - 1) > 0x4000) remaininglen_offset = 2;
+    else if ((publen - 1) > 0x80) remaininglen_offset = 1;
+    publen += remaininglen_offset;
+
+    uint8_t *packed = pack_mqtt_packet(&pkt, PUBLISH);
+    send_bytes(c->fd, packed, publen);
+
+    delete[] packed;
+    delete pub;
+}
+
+static void recursive_retained_delivery(struct trie_node *node, void *arg) {
+    if (!node || !node->topic_ptr) return;
+    struct topic *t = node->topic_ptr;
+    std::pair<struct sol_client*, unsigned>* args = static_cast<std::pair<struct sol_client*, unsigned>*>(arg);
+    send_retained_message(args->first, t, args->second);
+}
+
 static int subscribe_handler(struct closure *cb, union mqtt_packet *pkt) {
     struct sol_client *c = static_cast<struct sol_client *>(cb->obj);
     bool wildcard = false;
@@ -150,10 +196,17 @@ static int subscribe_handler(struct closure *cb, union mqtt_packet *pkt) {
             sub.client = c;
             sub.qos = pkt->subscribe.tuples[i].qos;
             trie_prefix_map_tuple(&sol.topics_trie, topic_str, recursive_subscription, &sub);
+            
+            std::pair<struct sol_client*, unsigned> args = {c, pkt->subscribe.tuples[i].qos};
+            trie_prefix_map_tuple(&sol.topics_trie, topic_str, recursive_retained_delivery, &args);
         }
 
         topic_add_subscriber(t, c, pkt->subscribe.tuples[i].qos, true);
         rcs[i] = pkt->subscribe.tuples[i].qos;
+
+        if (!wildcard && t->retained) {
+            send_retained_message(c, t, pkt->subscribe.tuples[i].qos);
+        }
     }
 
     union mqtt_packet suback;
@@ -214,13 +267,36 @@ static int publish_handler(struct closure *cb, union mqtt_packet *pkt) {
         sol_topic_put(&sol, t);
     }
 
+    if (pkt->publish.header.bits.retain) {
+        if (pkt->publish.payloadlen == 0) {
+            if (t->retained) {
+                delete[] t->retained->payload;
+                delete t->retained;
+                t->retained = nullptr;
+            }
+        } else {
+            if (!t->retained) {
+                t->retained = new struct retained_msg;
+            } else {
+                delete[] t->retained->payload;
+            }
+            t->retained->payload = new uint8_t[pkt->publish.payloadlen];
+            std::memcpy(t->retained->payload, pkt->publish.payload, pkt->publish.payloadlen);
+            t->retained->payload_len = pkt->publish.payloadlen;
+            t->retained->qos = pkt->publish.header.bits.qos;
+        }
+    }
+
     for (const auto &sub : t->subscribers) {
         size_t publen = MQTT_HEADER_LEN + sizeof(uint16_t) + pkt->publish.topiclen + pkt->publish.payloadlen;
         struct sol_client *sc = sub.client;
 
         pkt->publish.header.bits.qos = sub.qos;
-        if (pkt->publish.header.bits.qos > AT_MOST_ONCE)
+        if (pkt->publish.header.bits.qos > AT_MOST_ONCE) {
+            pkt->publish.pkt_id = sc->session.next_pkt_id++;
+            if (sc->session.next_pkt_id == 0) sc->session.next_pkt_id = 1; // skip 0
             publen += sizeof(uint16_t);
+        }
             
         int remaininglen_offset = 0;
         if ((publen - 1) > 0x200000) remaininglen_offset = 3;
@@ -232,6 +308,18 @@ static int publish_handler(struct closure *cb, union mqtt_packet *pkt) {
         ssize_t sent;
         if ((sent = send_bytes(sc->fd, pub, publen)) < 0) {
             sol_error("Error publishing to %s: %s", sc->client_id.c_str(), strerror(errno));
+        }
+
+        if (pkt->publish.header.bits.qos > AT_MOST_ONCE) {
+            struct in_flight_msg inflight;
+            inflight.pkt_id = pkt->publish.pkt_id;
+            inflight.qos = pkt->publish.header.bits.qos;
+            inflight.packed = new uint8_t[publen];
+            std::memcpy(inflight.packed, pub, publen);
+            inflight.packed_len = publen;
+            inflight.sent_at = time(nullptr);
+            inflight.is_pubrel = false;
+            sc->session.in_flight[inflight.pkt_id] = inflight;
         }
 
         info.bytes_sent += sent;
@@ -271,7 +359,14 @@ static int publish_handler(struct closure *cb, union mqtt_packet *pkt) {
 }
 
 static int puback_handler(struct closure *cb, union mqtt_packet *pkt) {
-    sol_debug("Received PUBACK from %s", static_cast<struct sol_client *>(cb->obj)->client_id.c_str());
+    struct sol_client *c = static_cast<struct sol_client *>(cb->obj);
+    sol_debug("Received PUBACK from %s", c->client_id.c_str());
+    
+    auto it = c->session.in_flight.find(pkt->ack.pkt_id);
+    if (it != c->session.in_flight.end()) {
+        delete[] it->second.packed;
+        c->session.in_flight.erase(it);
+    }
     return REARM_R;
 }
 
@@ -284,6 +379,17 @@ static int pubrec_handler(struct closure *cb, union mqtt_packet *pkt) {
     unsigned char *packed = pack_mqtt_packet(&ack, PUBREC);
     cb->payload = bytestring_create(MQTT_ACK_LEN);
     std::memcpy(cb->payload->data, packed, MQTT_ACK_LEN);
+    
+    auto it = c->session.in_flight.find(pkt->ack.pkt_id);
+    if (it != c->session.in_flight.end()) {
+        delete[] it->second.packed;
+        it->second.packed = new uint8_t[MQTT_ACK_LEN];
+        std::memcpy(it->second.packed, packed, MQTT_ACK_LEN);
+        it->second.packed_len = MQTT_ACK_LEN;
+        it->second.is_pubrel = true;
+        it->second.sent_at = time(nullptr);
+    }
+
     delete[] packed;
     sol_debug("Sending PUBREL to %s", c->client_id.c_str());
     return REARM_W;
@@ -304,7 +410,14 @@ static int pubrel_handler(struct closure *cb, union mqtt_packet *pkt) {
 }
 
 static int pubcomp_handler(struct closure *cb, union mqtt_packet *pkt) {
-    sol_debug("Received PUBCOMP from %s", static_cast<struct sol_client *>(cb->obj)->client_id.c_str());
+    struct sol_client *c = static_cast<struct sol_client *>(cb->obj);
+    sol_debug("Received PUBCOMP from %s", c->client_id.c_str());
+    
+    auto it = c->session.in_flight.find(pkt->ack.pkt_id);
+    if (it != c->session.in_flight.end()) {
+        delete[] it->second.packed;
+        c->session.in_flight.erase(it);
+    }
     return REARM_R;
 }
 
@@ -382,6 +495,7 @@ static void on_accept(struct evloop *loop, void *arg) {
     c->wbuf = nullptr;
     c->will_topic = nullptr;
     c->will_message = nullptr;
+    c->session.next_pkt_id = 1;
 
     struct closure *client_closure = new struct closure;
     client_closure->fd = conn.fd;
@@ -488,6 +602,7 @@ static void on_read(struct evloop *loop, void *arg) {
 
     info.bytes_recv += c->read;
     c->status = SENDING_DATA;
+    c->last_seen = time(nullptr);
 
     union mqtt_packet packet;
     if (unpack_mqtt_packet(c->rbuf + c->rpos, &packet) != 0) goto errdc;
@@ -578,13 +693,138 @@ static void on_write(struct evloop *loop, void *arg) {
     evloop_rearm_callback_read(loop, cb);
 }
 
+
+
+static void retransmit_unacked_messages(struct evloop *loop, void *args) {
+    long long now = time(nullptr);
+    for (const auto& pair : sol.clients) {
+        struct sol_client *c = pair.second;
+        for (auto& inflight_pair : c->session.in_flight) {
+            struct in_flight_msg& msg = inflight_pair.second;
+            if (now - msg.sent_at > 5) { // 5 seconds timeout
+                if (!msg.is_pubrel) {
+                    msg.packed[0] |= 0x08; // Set DUP flag
+                }
+                send_bytes(c->fd, msg.packed, msg.packed_len);
+                msg.sent_at = now;
+                sol_debug("Retransmitted packet %u to %s", msg.pkt_id, c->client_id.c_str());
+            }
+        }
+    }
+}
+
+static void save_retained_recursively(struct trie_node *node, std::FILE *f) {
+    if (!node) return;
+    if (node->topic_ptr && node->topic_ptr->retained) {
+        struct topic *t = node->topic_ptr;
+        uint16_t tlen = t->name.length();
+        std::fwrite(&tlen, sizeof(uint16_t), 1, f);
+        std::fwrite(t->name.c_str(), 1, tlen, f);
+        
+        uint8_t qos = t->retained->qos;
+        std::fwrite(&qos, sizeof(uint8_t), 1, f);
+        
+        uint32_t plen = t->retained->payload_len;
+        std::fwrite(&plen, sizeof(uint32_t), 1, f);
+        std::fwrite(t->retained->payload, 1, plen, f);
+    }
+    
+    for (struct trie_node* child : node->children) {
+        save_retained_recursively(child, f);
+    }
+}
+
+static void save_persistence() {
+    std::FILE *f = std::fopen("sol_persistence.dat", "wb");
+    if (!f) return;
+    
+    // Magic bytes
+    std::fwrite("SOL1", 1, 4, f);
+    
+    // Traverse trie and save retained
+    save_retained_recursively(sol.topics_trie.root, f);
+    
+    // EOF marker (topic length 0)
+    uint16_t end = 0;
+    std::fwrite(&end, sizeof(uint16_t), 1, f);
+    
+    std::fclose(f);
+    sol_debug("Saved persistence to disk");
+}
+
+static void load_persistence() {
+    std::FILE *f = std::fopen("sol_persistence.dat", "rb");
+    if (!f) return;
+    
+    char magic[4];
+    if (std::fread(magic, 1, 4, f) != 4 || std::strncmp(magic, "SOL1", 4) != 0) {
+        std::fclose(f);
+        return;
+    }
+    
+    while (true) {
+        uint16_t tlen;
+        if (std::fread(&tlen, sizeof(uint16_t), 1, f) != 1 || tlen == 0) break;
+        
+        char *tstr = new char[tlen + 1];
+        std::fread(tstr, 1, tlen, f);
+        tstr[tlen] = '\0';
+        
+        uint8_t qos;
+        std::fread(&qos, sizeof(uint8_t), 1, f);
+        
+        uint32_t plen;
+        std::fread(&plen, sizeof(uint32_t), 1, f);
+        
+        uint8_t *payload = new uint8_t[plen];
+        std::fread(payload, 1, plen, f);
+        
+        struct topic *t = topic_create(tstr);
+        t->retained = new struct retained_msg;
+        t->retained->payload = payload;
+        t->retained->payload_len = plen;
+        t->retained->qos = qos;
+        
+        sol_topic_put(&sol, t);
+        delete[] tstr;
+    }
+    
+    std::fclose(f);
+    sol_info("Loaded persistence from disk");
+}
+
 static void publish_stats(struct evloop *loop, void *args) {
     sol_debug("Publish stats tick");
-    // Part 4 full implementation
+    save_persistence();
+}
+
+static void check_keepalive(struct evloop *loop, void *args) {
+    long long now = time(nullptr);
+    std::vector<std::string> to_disconnect;
+    for (const auto& pair : sol.clients) {
+        struct sol_client *c = pair.second;
+        if (c->keepalive > 0) {
+            // MQTT spec says timeout is 1.5 * keepalive
+            if (now - c->last_seen > c->keepalive * 1.5) {
+                sol_info("Client %s timed out (keepalive)", c->client_id.c_str());
+                to_disconnect.push_back(c->client_id);
+            }
+        }
+    }
+    
+    for (const std::string& cid : to_disconnect) {
+        struct sol_client *c = sol.clients[cid];
+        shutdown(c->fd, SHUT_RDWR);
+        // We do not close the fd here because the event loop will trigger on_read 
+        // with 0 bytes (EOF) and cleanly trigger the errdc flow which cleans up 
+        // the client structures properly.
+    }
 }
 
 int start_server(const char *addr, const char *port) {
     trie_init(&sol.topics_trie);
+    
+    load_persistence();
 
     struct closure *server_closure = new struct closure;
     server_closure->fd = make_listen(addr, port, conf->socket_family);
@@ -603,7 +843,23 @@ int start_server(const char *addr, const char *port) {
     sys_closure->call = publish_stats;
     generate_uuid(sys_closure->closure_id);
 
+    struct closure *keepalive_closure = new struct closure;
+    keepalive_closure->fd = 0;
+    keepalive_closure->payload = nullptr;
+    keepalive_closure->args = keepalive_closure;
+    keepalive_closure->call = check_keepalive;
+    generate_uuid(keepalive_closure->closure_id);
+
+    struct closure *retransmit_closure = new struct closure;
+    retransmit_closure->fd = 0;
+    retransmit_closure->payload = nullptr;
+    retransmit_closure->args = retransmit_closure;
+    retransmit_closure->call = retransmit_unacked_messages;
+    generate_uuid(retransmit_closure->closure_id);
+
     evloop_add_periodic_task(event_loop, conf->stats_pub_interval, 0, sys_closure);
+    evloop_add_periodic_task(event_loop, 2, 0, keepalive_closure); // check keepalive every 2 seconds
+    evloop_add_periodic_task(event_loop, 5, 0, retransmit_closure); // check retransmits every 5 seconds
 
     sol_info("Server start");
     info.start_time = time(nullptr);

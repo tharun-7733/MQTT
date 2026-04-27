@@ -81,12 +81,19 @@ mosquitto_pub -h 127.0.0.1 -p 1883 -t "home/sensors/temperature" -m "22.5 C" -d
 
 You should instantly see the `mosquitto_sub` terminal receive the `"22.5 C"` message, while the broker's verbose logs (`-v`) will display the internal packet flow (`CONNECT`, `SUBSCRIBE`, `PUBLISH`, `PUBACK`).
 
-### Code Structure Reference
 
-- **`src/main.cpp`**: Application entry point, CLI arguments parsing.
-- **`src/server.cpp`**: Command handlers (`CONNECT`, `PUBLISH`, `SUBSCRIBE`, etc.) and the I/O state machine.
-- **`src/network.cpp`**: Non-blocking `kqueue` event loop abstraction.
-- **`src/mqtt.cpp`**: MQTT v3.1.1 byte-level deserialization.
-- **`src/pack.cpp`**: MQTT v3.1.1 byte-level serialization.
-- **`src/trie.cpp`**: Topic routing tree and wildcard evaluation algorithms.
-- **`src/config.cpp`**: Global configurations (Max request sizes, logging, etc.).
+Client connects
+   ↓
+Event loop detects
+   ↓
+State machine rebuilds packet
+   ↓
+Parser understands packet
+   ↓
+Handler decides action
+   ↓
+Trie finds subscribers
+   ↓
+Messages queued
+   ↓
+Event loop sends data

@@ -40,10 +40,20 @@ enum client_status {
     SENDING_DATA
 };
 
+struct in_flight_msg {
+    uint16_t pkt_id;
+    unsigned qos;
+    uint8_t *packed;
+    size_t packed_len;
+    long long sent_at;
+    bool is_pubrel;
+};
+
 /* A client session */
 struct session {
     std::list<struct topic *> subscriptions;
-    // TODO add pending confirmed messages
+    std::unordered_map<uint16_t, struct in_flight_msg> in_flight;
+    uint16_t next_pkt_id;
 };
 
 /* A connected MQTT client */
@@ -53,6 +63,10 @@ struct sol_client {
     uint8_t    *will_topic;
     uint8_t    *will_message;
     struct session session;
+
+    /* Keep-Alive */
+    long long last_seen;
+    uint16_t keepalive;
 
     /* I/O State Machine */
     enum client_status status;
@@ -72,10 +86,17 @@ struct subscriber {
     unsigned           qos;
 };
 
+struct retained_msg {
+    uint8_t *payload;
+    size_t payload_len;
+    unsigned qos;
+};
+
 /* A topic node: name (possibly a wildcard pattern) + subscriber list */
 struct topic {
     std::string           name;
     std::list<subscriber> subscribers;
+    struct retained_msg  *retained;
 };
 
 /* Global broker state */
