@@ -61,3 +61,29 @@ void pack_bytes(uint8_t **buf, uint8_t *str) {
     std::memcpy(*buf, str, len);
     (*buf) += len;
 }
+
+// bytestring helpers
+struct bytestring *bytestring_create(size_t len) {
+    struct bytestring *bstring = new struct bytestring;
+    bytestring_init(bstring, len);
+    return bstring;
+}
+
+void bytestring_init(struct bytestring *bstring, size_t size) {
+    if (!bstring) return;
+    bstring->size = size;
+    bstring->data = new uint8_t[size];
+    bytestring_reset(bstring);
+}
+
+void bytestring_release(struct bytestring *bstring) {
+    if (!bstring) return;
+    delete[] bstring->data;
+    delete bstring;
+}
+
+void bytestring_reset(struct bytestring *bstring) {
+    if (!bstring) return;
+    bstring->last = 0;
+    std::memset(bstring->data, 0, bstring->size);
+}

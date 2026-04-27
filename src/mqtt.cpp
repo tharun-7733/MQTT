@@ -201,28 +201,169 @@ int unpack_mqtt_packet(const uint8_t *buf, union mqtt_packet *pkt) {
     return rc;
 }
 
-uint8_t *pack_mqtt_packet(const union mqtt_packet *pkt, unsigned type) {
-    return nullptr; // Stub for now, as not implemented in part 1 of tutorial
-}
+/*
+ * MQTT packet building functions
+ */
 
 union mqtt_header *mqtt_packet_header(uint8_t byte) {
-    return nullptr; // Stub
+    static union mqtt_header header;
+    header.byte = byte;
+    return &header;
 }
 
 struct mqtt_ack *mqtt_packet_ack(uint8_t byte, uint16_t pkt_id) {
-    return nullptr; // Stub
+    static struct mqtt_ack ack;
+    ack.header.byte = byte;
+    ack.pkt_id = pkt_id;
+    return &ack;
 }
 
-struct mqtt_connack *mqtt_packet_connack(uint8_t byte, uint8_t c_flags, uint8_t rc) {
-    return nullptr; // Stub
+struct mqtt_connack *mqtt_packet_connack(uint8_t byte,
+                                         uint8_t cflags,
+                                         uint8_t rc) {
+    static struct mqtt_connack connack;
+    connack.header.byte = byte;
+    connack.byte = cflags;
+    connack.rc = rc;
+    return &connack;
 }
 
-struct mqtt_suback *mqtt_packet_suback(uint8_t byte, uint16_t pkt_id, uint8_t *rcs, uint16_t rcslen) {
-    return nullptr; // Stub
+struct mqtt_suback *mqtt_packet_suback(uint8_t byte,
+                                       uint16_t pkt_id,
+                                       uint8_t *rcs,
+                                       uint16_t rcslen) {
+    struct mqtt_suback *suback = new struct mqtt_suback;
+    suback->header.byte = byte;
+    suback->pkt_id = pkt_id;
+    suback->rcslen = rcslen;
+    suback->rcs = new uint8_t[rcslen];
+    std::memcpy(suback->rcs, rcs, rcslen);
+    return suback;
 }
 
-struct mqtt_publish *mqtt_packet_publish(uint8_t byte, uint16_t pkt_id, size_t topiclen, uint8_t *topic, size_t payloadlen, uint8_t *payload) {
-    return nullptr; // Stub
+struct mqtt_publish *mqtt_packet_publish(uint8_t byte,
+                                         uint16_t pkt_id,
+                                         size_t topiclen,
+                                         uint8_t *topic,
+                                         size_t payloadlen,
+                                         uint8_t *payload) {
+    struct mqtt_publish *publish = new struct mqtt_publish;
+    publish->header.byte = byte;
+    publish->pkt_id = pkt_id;
+    publish->topiclen = topiclen;
+    publish->topic = topic;
+    publish->payloadlen = payloadlen;
+    publish->payload = payload;
+    return publish;
+}
+
+/*
+ * MQTT packets packing functions
+ */
+
+typedef uint8_t *mqtt_pack_handler(const union mqtt_packet *);
+
+static uint8_t *pack_mqtt_header(const union mqtt_header *hdr) {
+    uint8_t *packed = new uint8_t[MQTT_HEADER_LEN];
+    uint8_t *ptr = packed;
+    pack_u8(&ptr, hdr->byte);
+    /* Encode 0 length bytes, packets like this have only a fixed header */
+    mqtt_encode_length(ptr, 0);
+    return packed;
+}
+
+static uint8_t *pack_mqtt_ack(const union mqtt_packet *pkt) {
+    uint8_t *packed = new uint8_t[MQTT_ACK_LEN];
+    uint8_t *ptr = packed;
+    pack_u8(&ptr, pkt->ack.header.byte);
+    mqtt_encode_length(ptr, MQTT_HEADER_LEN);
+    ptr++;
+    pack_u16(&ptr, pkt->ack.pkt_id);
+    return packed;
+}
+
+static uint8_t *pack_mqtt_connack(const union mqtt_packet *pkt) {
+    uint8_t *packed = new uint8_t[MQTT_ACK_LEN];
+    uint8_t *ptr = packed;
+    pack_u8(&ptr, pkt->connack.header.byte);
+    mqtt_encode_length(ptr, MQTT_HEADER_LEN);
+    ptr++;
+    pack_u8(&ptr, pkt->connack.byte);
+    pack_u8(&ptr, pkt->connack.rc);
+    return packed;
+}
+
+static uint8_t *pack_mqtt_suback(const union mqtt_packet *pkt) {
+    size_t pktlen = MQTT_HEADER_LEN + sizeof(uint16_t) + pkt->suback.rcslen;
+    uint8_t *packed = new uint8_t[pktlen];
+    uint8_t *ptr = packed;
+    pack_u8(&ptr, pkt->suback.header.byte);
+    size_t len = sizeof(uint16_t) + pkt->suback.rcslen;
+    int step = mqtt_encode_length(ptr, len);
+    ptr += step;
+    pack_u16(&ptr, pkt->suback.pkt_id);
+    for (int i = 0; i < pkt->suback.rcslen; i++)
+        pack_u8(&ptr, pkt->suback.rcs[i]);
+    return packed;
+}
+
+static uint8_t *pack_mqtt_publish(const union mqtt_packet *pkt) {
+    /*
+     * Calculate the total length of the packet including header and
+     * length field of the fixed header part
+     */
+    size_t pktlen = MQTT_HEADER_LEN + sizeof(uint16_t) +
+        pkt->publish.topiclen + pkt->publish.payloadlen;
+    if (pkt->header.bits.qos > AT_MOST_ONCE)
+        pktlen += sizeof(uint16_t);
+    int remaininglen_offset = 0;
+    if ((pktlen - 1) > 0x200000)
+        remaininglen_offset = 3;
+    else if ((pktlen - 1) > 0x4000)
+        remaininglen_offset = 2;
+    else if ((pktlen - 1) > 0x80)
+        remaininglen_offset = 1;
+    pktlen += remaininglen_offset;
+    uint8_t *packed = new uint8_t[pktlen];
+    uint8_t *ptr = packed;
+    pack_u8(&ptr, pkt->publish.header.byte);
+    // Total len of the packet excluding fixed header len
+    size_t len = pktlen - MQTT_HEADER_LEN - remaininglen_offset;
+    int step = mqtt_encode_length(ptr, len);
+    ptr += step;
+    // Topic len followed by topic name in bytes
+    pack_u16(&ptr, pkt->publish.topiclen);
+    pack_bytes(&ptr, pkt->publish.topic);
+    // Packet id
+    if (pkt->header.bits.qos > AT_MOST_ONCE)
+        pack_u16(&ptr, pkt->publish.pkt_id);
+    // Finally the payload
+    pack_bytes(&ptr, pkt->publish.payload);
+    return packed;
+}
+
+static mqtt_pack_handler *pack_handlers[13] = {
+    nullptr,
+    nullptr,
+    pack_mqtt_connack,
+    pack_mqtt_publish,
+    pack_mqtt_ack,
+    pack_mqtt_ack,
+    pack_mqtt_ack,
+    pack_mqtt_ack,
+    nullptr,
+    pack_mqtt_suback,
+    nullptr,
+    pack_mqtt_ack,
+    nullptr
+};
+
+uint8_t *pack_mqtt_packet(const union mqtt_packet *pkt, unsigned type) {
+    if (type == PINGREQ || type == PINGRESP)
+        return pack_mqtt_header(&pkt->header);
+    if (type < 13 && pack_handlers[type] != nullptr)
+        return pack_handlers[type](pkt);
+    return nullptr;
 }
 
 void mqtt_packet_release(union mqtt_packet *pkt, unsigned type) {
