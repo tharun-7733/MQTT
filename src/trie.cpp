@@ -77,3 +77,37 @@ void trie_find(struct trie *t, const std::string &topic_str, std::vector<struct 
     std::vector<std::string> levels = split_topic(topic_str);
     trie_find_recursive(t->root, levels, 0, matches);
 }
+
+static void trie_prefix_map_func(struct trie_node *node, void (*mapfunc)(struct trie_node *, void *), void *arg) {
+    if (!node) return;
+    mapfunc(node, arg);
+    for (auto child : node->children) {
+        trie_prefix_map_func(child, mapfunc, arg);
+    }
+}
+
+void trie_prefix_map_tuple(struct trie *t, const std::string &prefix,
+                           void (*mapfunc)(struct trie_node *, void *), void *arg) {
+    if (!t->root) return;
+    
+    if (prefix.empty()) {
+        trie_prefix_map_func(t->root, mapfunc, arg);
+        return;
+    }
+    
+    std::vector<std::string> levels = split_topic(prefix);
+    struct trie_node *node = t->root;
+    for (const auto &level : levels) {
+        struct trie_node *next = nullptr;
+        for (auto child : node->children) {
+            if (child->topic_level == level) {
+                next = child;
+                break;
+            }
+        }
+        if (!next) return; // Prefix not found
+        node = next;
+    }
+    
+    trie_prefix_map_func(node, mapfunc, arg);
+}

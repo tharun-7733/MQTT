@@ -31,12 +31,38 @@ struct sol_info {
     long long messages_recv;
 };
 
+/* State machine for non-blocking I/O */
+enum client_status {
+    WAITING_HEADER,
+    WAITING_LENGTH,
+    WAITING_DATA,
+    SENDING_DATA
+};
+
+/* A client session */
+struct session {
+    std::list<struct topic *> subscriptions;
+    // TODO add pending confirmed messages
+};
+
 /* A connected MQTT client */
 struct sol_client {
     int         fd;
     std::string client_id;
     uint8_t    *will_topic;
     uint8_t    *will_message;
+    struct session session;
+
+    /* I/O State Machine */
+    enum client_status status;
+    size_t rpos;       // Offset of payload
+    size_t read;       // Bytes read so far
+    size_t toread;     // Bytes we need to read in total
+    uint8_t *rbuf;     // Read buffer
+    
+    size_t wrote;      // Bytes written so far
+    size_t towrite;    // Bytes we need to write in total
+    uint8_t *wbuf;     // Write buffer
 };
 
 /* One entry in a topic's subscriber list */

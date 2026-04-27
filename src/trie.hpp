@@ -29,4 +29,8 @@ void trie_insert(struct trie *t, const std::string &topic_str, struct topic *tp)
 /* Find all topics matching a given publish topic string (handles + and # wildcards) */
 void trie_find(struct trie *t, const std::string &topic_str, std::vector<struct topic *> &matches);
 
+/* Map a function to all nodes matching a given prefix */
+void trie_prefix_map_tuple(struct trie *t, const std::string &prefix,
+                           void (*mapfunc)(struct trie_node *, void *), void *arg);
+
 #endif // TRIE_HPP
