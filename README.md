@@ -29,7 +29,7 @@ MQTT allows clients to subscribe to hierarchical topics (like `home/livingroom/t
 - **The Trie:** To route messages efficiently, the broker stores subscriptions in a Trie (Prefix Tree).
 - **Matching:** When a `PUBLISH` message is received, the broker recursively walks the Trie to find all matching topic nodes, automatically honoring wildcards. It then broadcasts the message to all `std::list<subscriber>` attached to those nodes.
 
----
+---------
 
 ## Guide: How to Build and Use
 
